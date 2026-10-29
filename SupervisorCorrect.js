@@ -7,14 +7,26 @@
 // (source of truth), audited to Attendance_Amendments. Rebuild Attendance_Daily
 // afterwards to reflect the fixes.
 //
-// ENDPOINTS: getSupervisorSessions, correctSession, addSession
+// FIX: correctSession / addSession now reject any correction that would
+// produce a session over SC_MAX_HRS (20h) — the same cap Attendance_Daily
+// already uses downstream. Previously a bad date (e.g. checkout landing on
+// the wrong day) sailed through as "fixed" and only got caught later as a
+// cryptic REVIEW flag in Attendance_Daily. Now it's rejected immediately,
+// at the point of correction, with a clear reason.
+//
+// ENDPOINTS: getSupervisorSessions, correctSession, addSession, deleteSession
 // ============================================================
 
 const SC_FROM = '01-09-2026';
-const SC_TO   = '03-09-2026';
+const SC_TO   = '22-09-2026';
 // Upper cutoff: sessions whose CHECK-IN is before this are included. Excludes
 // the 03/09 noon shift that is still in progress (would show as "no check-out").
 const SC_CUTOFF = new Date(2026, 8, 3, 11, 0, 0); // 03-09-2026 11:00 (month is 0-based)
+
+// Sanity cap for a single session — matches Attendance_Daily's MAX_HRS.
+// No shift at Maya Tex runs anywhere near this long; anything over this
+// is almost always a wrong date, not a real shift.
+const SC_MAX_HRS = 20;
 
 function sc_inWindow_(dStr) {
   const d = parseFlexibleDate_(dStr);
@@ -32,6 +44,10 @@ function sc_normDay_(v) {
   var m = s.match(/^(\d{1,2})[-\/](\d{1,2})[-\/](\d{4})$/); if (m) return m[1].padStart(2,'0')+'-'+m[2].padStart(2,'0')+'-'+m[3];
   m = s.match(/^(\d{4})[-\/](\d{1,2})[-\/](\d{1,2})/); if (m) return m[3].padStart(2,'0')+'-'+m[2].padStart(2,'0')+'-'+m[1];
   var d = new Date(s); return isNaN(d.getTime()) ? s : formatDdMmYyyy_(d);
+}
+// Hours between two Date objects (raw, no wraparound — used for the sanity check).
+function sc_hoursBetween_(a, b) {
+  return (b.getTime() - a.getTime()) / 3600000;
 }
 
 // Sessions for a supervisor's location within the cleanup window, plus the
@@ -80,14 +96,20 @@ function getSupervisorSessions(params) {
         if(cur) sessions.push(cur);
       });
     }
-    // Filter to window + shape for UI, flag broken (<1h or no checkout).
+    // Filter to window + shape for UI, flag broken (<1h, no checkout, OR too long).
     const out=[];
     sessions.forEach(s=>{
       const dateStr=formatDdMmYyyy_(s.ciTs);
       if(!sc_checkinInWindow_(s.ciTs)) return; // check-in must be before 03/09 11:00
       let presence=null, broken=false, reason='';
       if(!s.coTs){ broken=true; reason='No check-out'; }
-      else { let mins=(s.coTs-s.ciTs)/60000; if(mins<0) mins+=1440; presence=Math.round((mins/60)*100)/100; if(presence<1){ broken=true; reason='Too short ('+presence+'h)'; } }
+      else {
+        let mins=(s.coTs-s.ciTs)/60000; if(mins<0) mins+=1440; presence=Math.round((mins/60)*100)/100;
+        if(presence<1){ broken=true; reason='Too short ('+presence+'h)'; }
+        // NEW: flag implausibly long sessions too — almost always a wrong date,
+        // not a real shift. Matches Attendance_Daily's own MAX_HRS cap.
+        else if(presence>SC_MAX_HRS){ broken=true; reason='Too long ('+presence+'h — check the date, not just the time)'; }
+      }
       out.push({ empId:s.empId, name:s.name, date:dateStr, ciRow:s.ciRow, coRow:s.coRow,
         checkIn:Utilities.formatDate(s.ciTs,tz_(),'HH:mm'), checkOut:s.coTs?Utilities.formatDate(s.coTs,tz_(),'HH:mm'):'',
         presence:presence, broken:broken, reason:reason });
@@ -97,12 +119,33 @@ function getSupervisorSessions(params) {
     const seenCount = {};
     out.forEach(r => { const k = r.empId + '|' + r.date; seenCount[k] = (seenCount[k] || 0) + 1; });
     out.forEach(r => { r.duplicate = (seenCount[r.empId + '|' + r.date] > 1); });
-    return { success:true, location:location, window:{from:SC_FROM,to:SC_TO}, sessions:out, employees:locEmployees, shifts:shifts };
+
+    // ── ONLY RETURN WHAT STILL NEEDS ATTENTION ────────────────────────
+    // Previously every session was returned and the broken ones merely
+    // highlighted. That meant a supervisor who corrected a session still
+    // saw it on the list, with no way to tell it apart from one he had
+    // not touched — so he could not tell how much work was left.
+    //
+    // A session earns its place here only if it is still broken (no
+    // check-out, under 1h, over 20h) or duplicated. Correct it and it
+    // disappears on the next load, because the check is recomputed from
+    // live Attendance_Log data every time — there is no "mark as fixed"
+    // step to forget.
+    const needsAttention = out.filter(r => r.broken || r.duplicate);
+    return { success:true, location:location, window:{from:SC_FROM,to:SC_TO},
+             sessions:needsAttention, totalSessions:out.length,
+             resolved: out.length - needsAttention.length,
+             employees:locEmployees, shifts:shifts };
   } catch (err) { return { success:false, error: err.toString() }; }
 }
 
 // Correct a session's Check In / Check Out times (and optional shift note) by row.
 // params: { ciRow, coRow, date, checkIn(HH:mm), checkOut(HH:mm), coNextDay(bool), by }
+//
+// FIX: now computes the resulting session length BEFORE writing anything,
+// and rejects the whole correction if it would exceed SC_MAX_HRS. Nothing
+// is written to Attendance_Log if the check fails — the supervisor gets a
+// clear error instead of a silently-wrong 60+ hour "session."
 function correctSession(params) {
   try {
     params = (typeof params==='string')?JSON.parse(params):(params||{});
@@ -113,6 +156,41 @@ function correctSession(params) {
     const cAuth=H.findIndex(h=>String(h).trim().toLowerCase()==='auth');
     const d=parseFlexibleDate_(params.date); if(!d) return {success:false,error:'bad date'};
     const mkTs=(hhmm,nextDay)=>{ const base=new Date(d.getTime()+(nextDay?86400000:0)); return Utilities.formatDate(base,tz_(),'dd/MM/yyyy')+' '+hhmm+':00'; };
+
+    // ── Sanity check BEFORE writing anything ──────────────────────────
+    // Need the OTHER end of the session (the one not being changed right
+    // now) to compute what the resulting presence would actually be.
+    let ciTsCheck = null, coTsCheck = null;
+    if (params.ciRow && params.checkIn) {
+      const [hh, mm] = params.checkIn.split(':').map(Number);
+      ciTsCheck = new Date(d.getFullYear(), d.getMonth(), d.getDate(), hh, mm, 0);
+    } else if (params.ciRow) {
+      // Row exists but no new time given — read the current value.
+      const raw = log.getRange(Number(params.ciRow), cTs+1).getValue();
+      ciTsCheck = (typeof parseLogTimestamp === 'function') ? parseLogTimestamp(raw) : null;
+    }
+    if (params.coRow && params.checkOut) {
+      const [hh, mm] = params.checkOut.split(':').map(Number);
+      const base = new Date(d.getTime() + (params.coNextDay ? 86400000 : 0));
+      coTsCheck = new Date(base.getFullYear(), base.getMonth(), base.getDate(), hh, mm, 0);
+    } else if (params.coRow) {
+      const raw = log.getRange(Number(params.coRow), cTs+1).getValue();
+      coTsCheck = (typeof parseLogTimestamp === 'function') ? parseLogTimestamp(raw) : null;
+    }
+    if (ciTsCheck && coTsCheck) {
+      const hrs = sc_hoursBetween_(ciTsCheck, coTsCheck);
+      if (hrs > SC_MAX_HRS) {
+        return { success:false, error:
+          'This would create a ' + hrs.toFixed(1) + '-hour session — that is almost ' +
+          'certainly a wrong date, not a real shift. Check the checkout date ' +
+          '(it may still be pointing at today\'s date instead of the session\'s ' +
+          'actual date) and try again.' };
+      }
+      if (hrs < 0) {
+        return { success:false, error: 'Check-out is before check-in. Check the times and the "next day" setting.' };
+      }
+    }
+
     const changes=[];
     if(params.ciRow && params.checkIn){ log.getRange(Number(params.ciRow),cTs+1).setValue(mkTs(params.checkIn,false)); if(cAuth!==-1) log.getRange(Number(params.ciRow),cAuth+1).setValue('Supervisor corrected'); changes.push('CheckIn->'+params.checkIn); }
     if(params.coRow && params.checkOut){ log.getRange(Number(params.coRow),cTs+1).setValue(mkTs(params.checkOut, !!params.coNextDay)); if(cAuth!==-1) log.getRange(Number(params.coRow),cAuth+1).setValue('Supervisor corrected'); changes.push('CheckOut->'+params.checkOut+(params.coNextDay?'(+1)':'')); }
@@ -123,6 +201,8 @@ function correctSession(params) {
 
 // Add a missing session (Check In + Check Out) from the WA list.
 // params: { empId, date, shift, checkIn, checkOut, coNextDay, location, by }
+//
+// FIX: same SC_MAX_HRS sanity check applied before writing.
 function addSession(params) {
   try {
     params = (typeof params==='string')?JSON.parse(params):(params||{});
@@ -130,6 +210,22 @@ function addSession(params) {
     const date=String(params.date||'').trim();
     if(!empId||!date||!params.checkIn||!params.checkOut) return {success:false,error:'Employee, date, check-in and check-out required.'};
     if(!sc_inWindow_(date)) return {success:false,error:'Date must be 01–03 Sep 2026.'};
+
+    const d0 = parseFlexibleDate_(date);
+    const [ciH, ciM] = params.checkIn.split(':').map(Number);
+    const ciTsCheck = new Date(d0.getFullYear(), d0.getMonth(), d0.getDate(), ciH, ciM, 0);
+    const [coH, coM] = params.checkOut.split(':').map(Number);
+    const coBase = new Date(d0.getTime() + (params.coNextDay ? 86400000 : 0));
+    const coTsCheck = new Date(coBase.getFullYear(), coBase.getMonth(), coBase.getDate(), coH, coM, 0);
+    const hrs = sc_hoursBetween_(ciTsCheck, coTsCheck);
+    if (hrs > SC_MAX_HRS) {
+      return { success:false, error:
+        'This would create a ' + hrs.toFixed(1) + '-hour session — check the checkout date, not just the time.' };
+    }
+    if (hrs < 0) {
+      return { success:false, error: 'Check-out is before check-in. Check the times and the "next day" setting.' };
+    }
+
     const ss=SpreadsheetApp.openById(MAIN_SPREADSHEET_ID);
     const log=ss.getSheetByName('Attendance_Log');
     const H=log.getRange(1,1,1,log.getLastColumn()).getValues()[0];

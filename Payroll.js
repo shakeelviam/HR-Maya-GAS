@@ -37,215 +37,37 @@ const PAYROLL_INPUTS_TAB  = 'Payroll_Inputs';
 //                     mode?:'attendance'|'manual', excludeIds?:'MT-1,MT-2' }
 // params (legacy convenience): { month:1-12, year:2026, mode?, excludeIds? }
 // ============================================================
+// ============================================================
+// RETIRED — computeMonthlyPayroll
+// ------------------------------------------------------------
+// This was a SECOND payroll engine running alongside runPayrollFromReview
+// (PayrollReview.gs). Both wrote the same 'Payroll ddMMM-ddMMM' tab name and
+// both logged to the same control tab, but they produced DIFFERENT numbers:
+// this one had no unpaid-leave, absence, encashment or scheduled deductions,
+// and used a hardcoded DUTY_HOURS instead of each employee's shift hours.
+// Whichever page you happened to use decided what people got paid, and the
+// control log could not tell you which engine produced a given run.
+//
+// The two things this engine did BETTER have been ported into
+// PayrollReview.gs (see resolvePayrollPeriod_):
+//   1. Refusing a period shorter than 7 days unless force=true
+//   2. Defaulting the period start sensibly rather than producing a sliver
+//
+// runPayrollFromReview is now the single payroll engine.
+//
+// This stub is deliberately left in place instead of deleting the function,
+// so that any old bookmark, script or router case that still calls it fails
+// LOUDLY with an explanation rather than silently doing nothing.
+// ============================================================
 function computeMonthlyPayroll(params) {
-  try {
-    params = params || {};
-    const ss = SpreadsheetApp.openById(MAIN_SPREADSHEET_ID);
-
-    const mode = String(params.mode || 'attendance').trim().toLowerCase() === 'manual' ? 'manual' : 'attendance';
-    const excludeIds = String(params.excludeIds || '')
-      .split(',').map(s => s.trim().toUpperCase()).filter(Boolean);
-
-    // ---- 1. Resolve the period ----
-    let periodStart, periodEnd, tabName, isRollingMode;
-
-    if (params.periodEnd) {
-      isRollingMode = true;
-      const pe = parseFlexibleDate_(params.periodEnd);
-      if (!pe) return { success: false, error: 'periodEnd must be a valid date (dd-mm-yyyy)' };
-      periodEnd = endOfDay_(pe);
-
-      // Pay cycle: salary paid by the 25th, so a run always covers the 1st of the
-      // month through the chosen cutoff (21st-24th). Default the start to the 1st
-      // of periodEnd's month, so picking an end date can never produce a sliver
-      // window. An explicit periodStart still overrides (rare exceptions).
-      if (params.periodStart) {
-        const ps = parseFlexibleDate_(params.periodStart);
-        if (!ps) return { success: false, error: 'periodStart must be a valid date (dd-mm-yyyy)' };
-        periodStart = startOfDay_(ps);
-      } else {
-        periodStart = new Date(pe.getFullYear(), pe.getMonth(), 1, 0, 0, 0, 0); // 1st of the month
-      }
-
-      if (periodStart > periodEnd) {
-        return { success: false, error: 'periodStart (' + formatDdMmYyyy_(periodStart) + ') is after periodEnd (' + formatDdMmYyyy_(periodEnd) + ').' };
-      }
-
-      // Backstop guard: refuse an abnormally short window unless forced, so a
-      // wrong end date can't silently pay a fraction of the month's OT.
-      const spanDays = Math.round((startOfDay_(periodEnd) - startOfDay_(periodStart)) / 86400000) + 1;
-      const force = String(params.force || '').toLowerCase() === 'true';
-      if (spanDays < 7 && !force) {
-        return { success: false, error: 'This period is only ' + spanDays + ' day(s) (' + formatDdMmYyyy_(periodStart) + ' to ' + formatDdMmYyyy_(periodEnd) + '). A monthly run normally covers the 1st through the 21st-24th (~20+ days). If this really is intentional, re-run with force=true.' };
-      }
-
-      tabName = 'Payroll ' + Utilities.formatDate(periodStart, tz_(), 'ddMMM') + '-' + Utilities.formatDate(periodEnd, tz_(), 'ddMMM');
-    } else {
-      isRollingMode = false;
-      const now = new Date();
-      const month = parseInt(params.month || (now.getMonth() + 1), 10);
-      const year = parseInt(params.year || now.getFullYear(), 10);
-      periodStart = new Date(year, month - 1, 1, 0, 0, 0);
-      periodEnd = new Date(year, month, 0, 23, 59, 59, 999);
-      tabName = 'Payroll ' + String(month).padStart(2, '0') + '-' + year;
-    }
-
-    // ---- 2. Salary master from 'HR Maya' (read-only) ----
-    const hr = ss.getSheetByName('HR Maya');
-    if (!hr) return { success: false, error: "'HR Maya' tab not found" };
-    const hrData = hr.getDataRange().getValues();
-    if (hrData.length <= 1) return { success: false, error: 'HR Maya has no employee rows' };
-
-    const H = hrData[0];
-    const col = (name) => H.findIndex(h => String(h).trim().toLowerCase() === name.toLowerCase());
-    const cId = col('Employee ID'), cName = col('Name (English)'), cBasic = col('Basic Salary'),
-          cFood = col('Food Allowance'), cAccom = col('Accommodation'), cConv = col('Conveyance'),
-          cBonus = col('Bonus'), cLoan = col('Loan'), cDed = col('Other Deductions'), cRate = col('Price Per Hour'), cStatus = col('Status');
-
-    const need = { 'Employee ID': cId, 'Name (English)': cName, 'Basic Salary': cBasic, 'Price Per Hour': cRate };
-    const missing = Object.keys(need).filter(k => need[k] === -1);
-    if (missing.length) return { success: false, error: 'HR Maya missing column(s): ' + missing.join(', ') };
-
-    const emp = {};
-    const order = [];
-    const skippedInactive = [];
-    for (let i = 1; i < hrData.length; i++) {
-      const id = String(hrData[i][cId] || '').trim();
-      if (!id) continue;
-      if (excludeIds.indexOf(id.toUpperCase()) !== -1) continue; // omit advance-paid / excluded staff
-      // Only Active employees are paid. Blank status is treated as Active
-      // (legacy rows); explicit 'Inactive' / 'On Leave' are skipped.
-      const statusVal = cStatus !== -1 ? String(hrData[i][cStatus] || '').trim().toLowerCase() : '';
-      if (statusVal && statusVal !== 'active') { skippedInactive.push({ id: id, status: String(hrData[i][cStatus]).trim() }); continue; }
-      emp[id] = {
-        id: id,
-        name:  String(hrData[i][cName] || '').trim(),
-        basic: Number(hrData[i][cBasic]) || 0,
-        food:  cFood  !== -1 ? Number(hrData[i][cFood])  || 0 : 0,
-        accom: cAccom !== -1 ? Number(hrData[i][cAccom]) || 0 : 0,
-        conv:  cConv  !== -1 ? Number(hrData[i][cConv])  || 0 : 0,
-        bonus: cBonus !== -1 ? Number(hrData[i][cBonus]) || 0 : 0,
-        loanRef: cLoan !== -1 ? Number(hrData[i][cLoan]) || 0 : 0, // reference-only, not subtracted
-        otherRef: cDed !== -1 ? Number(hrData[i][cDed]) || 0 : 0,  // reference-only, not subtracted
-        rate:  Number(hrData[i][cRate]) || 0,
-        otHours: 0, deductions: 0, remark: '', encashDays: 0, encashAmt: 0, flags: []
-      };
-      order.push(id);
-    }
-
-    // ---- 3a. Deductions + remark from Payroll_Inputs (both modes) ----
-    const inputs = getPayrollInputs_(ss, formatDdMmYyyy_(periodEnd)); // { empId: {deductions, remark} }
-    Object.keys(inputs).forEach(id => {
-      if (!emp[id]) return;
-      emp[id].deductions = KD(inputs[id].deductions);
-      emp[id].remark = inputs[id].remark || '';
-    });
-
-    // Manual mode: OT hours come from the OT_Entries tab, summed over the period.
-    if (mode === 'manual') {
-      const otByEmp = getOtHoursForPeriod_(ss, periodStart, periodEnd); // { empId: totalHours }
-      Object.keys(otByEmp).forEach(id => { if (emp[id]) emp[id].otHours = otByEmp[id]; });
-    }
-
-    // ---- 3a-ii. Leave encashment attached to this Period End (from Encashment_Log) ----
-    const encash = getEncashmentsForPeriod_(ss, formatDdMmYyyy_(periodEnd));
-    Object.keys(encash).forEach(id => {
-      if (!emp[id]) return;
-      emp[id].encashDays = Number(encash[id].days) || 0;
-      emp[id].encashAmt = KD(encash[id].amount);
-    });
-
-    // ---- 3b. Attendance -> OT cycles (attendance mode only) ----
-    if (mode === 'attendance') {
-      const log = ss.getSheetByName('Attendance_Log');
-      if (log) {
-        const L = log.getDataRange().getValues();
-        const byEmp = {};
-        for (let i = 0; i < L.length; i++) {
-          const empId = String(L[i][1] || '').trim();
-          const stage = String(L[i][4] || '').trim();
-          if (!empId || (stage !== 'Check In' && stage !== 'Check Out')) continue;
-          const ts = parseLogTimestamp(L[i][0]);
-          if (!ts) continue;
-          (byEmp[empId] = byEmp[empId] || []).push({ ts, stage });
-        }
-        Object.keys(byEmp).forEach(empId => {
-          if (!emp[empId]) return;
-          const rows = byEmp[empId].sort((a, b) => a.ts - b.ts);
-          const cycles = buildCycles_(rows);
-          cycles.forEach(c => {
-            if (!c.checkOut) { emp[empId].flags.push('Open shift since ' + formatDdMmYyyyHm_(c.checkIn) + ' — no Check Out yet'); return; }
-            if (c.incomplete) { emp[empId].flags.push('Incomplete cycle: Check In ' + formatDdMmYyyyHm_(c.checkIn) + ' had no Check Out before the next Check In'); return; }
-            if (c.checkOut < periodStart || c.checkOut > periodEnd) return; // outside this period; a later run picks it up
-            const presence = (c.checkOut - c.checkIn) / 3600000;
-            if (presence <= 0) { emp[empId].flags.push('Check Out not after Check In near ' + formatDdMmYyyyHm_(c.checkIn)); return; }
-            const ot = presence - DUTY_HOURS;
-            if (ot > 0) emp[empId].otHours += ot;
-          });
-        });
-      }
-    }
-
-    // ---- 4. Build snapshot rows ----
-    const headers = ['Employee ID','Name (English)','Basic Salary','Food Allowance','Accommodation',
-      'Conveyance','Bonus','Gross Salary','OT Hours','Price Per Hour','OT Amount',
-      'Encash Days','Encashment','Deductions','Deduction Remark','Total Payable','Flags'];
-    const rows = [headers];
-    let tGross = 0, tOtAmt = 0, tEnc = 0, tDed = 0, tPay = 0, totalOtHours = 0;
-
-    order.forEach(id => {
-      const e = emp[id];
-      const gross    = KD(e.basic + e.food + e.accom + e.conv + e.bonus);
-      const otHrsDisplay = Math.round(e.otHours * 100) / 100;
-      const otAmount = KD(e.otHours * e.rate);
-      const encAmt   = KD(e.encashAmt);
-      const ded      = KD(e.deductions);
-      const payable  = KD(gross + otAmount + encAmt - ded);
-      totalOtHours += e.otHours;
-      tGross += gross; tOtAmt += otAmount; tEnc += encAmt; tDed += ded; tPay += payable;
-      rows.push([e.id, e.name, KD(e.basic), KD(e.food), KD(e.accom), KD(e.conv), KD(e.bonus),
-        gross, otHrsDisplay, KD(e.rate), otAmount, (e.encashDays || ''), encAmt, ded, e.remark, payable,
-        e.flags.length ? e.flags.join('; ') : '']);
-    });
-
-    // Totals row
-    rows.push(['', 'TOTALS (' + (rows.length - 1) + ' staff)', '', '', '', '', '',
-      KD(tGross), Math.round(totalOtHours * 100) / 100, '', KD(tOtAmt), '', KD(tEnc), KD(tDed), '', KD(tPay), '']);
-
-    // ---- 5. Write / refresh the period tab ----
-    let out = ss.getSheetByName(tabName) || ss.insertSheet(tabName);
-    out.clear();
-    out.getRange(1, 1, rows.length, headers.length).setValues(rows);
-    out.getRange(1, 1, 1, headers.length).setFontWeight('bold');
-    out.getRange(rows.length, 1, 1, headers.length).setFontWeight('bold').setBackground('#f2f4f7');
-    if (rows.length > 2) {
-      [3,4,5,6,7,8,10,11,13,14,16].forEach(c => out.getRange(2, c, rows.length - 1, 1).setNumberFormat('0.000'));
-      out.getRange(2, 9, rows.length - 1, 1).setNumberFormat('0.00'); // OT Hours
-    }
-    out.setFrozenRows(1);
-    out.autoResizeColumns(1, headers.length);
-
-    // ---- 6. Log this run (rolling mode only) ----
-    if (isRollingMode) {
-      logPayrollRun_(ss, periodStart, periodEnd, order.length, totalOtHours, tabName, mode);
-    }
-
-    const flagList = order.filter(id => emp[id].flags.length)
-      .map(id => ({ id: emp[id].id, name: emp[id].name, detail: emp[id].flags.join('; ') }));
-    return {
-      success: true, tab: tabName, mode: mode,
-      periodStart: formatDdMmYyyy_(periodStart), periodEnd: formatDdMmYyyy_(periodEnd),
-      employees: order.length, excluded: excludeIds,
-      skippedInactive: skippedInactive,
-      totalPayable: KD(tPay), totalDeductions: KD(tDed), totalOtAmount: KD(tOtAmt), totalEncashment: KD(tEnc),
-      flaggedEmployees: flagList.length, flags: flagList,
-      message: 'Wrote "' + tabName + '" (' + formatDdMmYyyy_(periodStart) + ' to ' + formatDdMmYyyy_(periodEnd) + ', ' + mode + ' mode): ' +
-        order.length + ' employees, ' + flagList.length + ' with attendance flags' +
-        (skippedInactive.length ? ', ' + skippedInactive.length + ' inactive skipped.' : '.')
-    };
-  } catch (err) {
-    return { success: false, error: err.toString() };
-  }
+  return {
+    success: false,
+    retired: true,
+    error: 'computeMonthlyPayroll has been retired. Use the Payroll Review page ' +
+           '(getPayrollReview / runPayrollFromReview) — it is now the single payroll ' +
+           'engine and includes unpaid leave, absence, encashment and scheduled ' +
+           'deductions, which this function never applied.'
+  };
 }
 
 // ============================================================
@@ -487,7 +309,10 @@ function amendAttendance(params) {
     const action = String(params.action || 'set').trim().toLowerCase();
     const admin  = String(params.admin  || 'Unknown').trim();
     if (!empId || !dateInput) return { success: false, error: 'empId and date are required' };
-    if (!['Check In','Break Out','Break In','Check Out'].includes(stage)) return { success: false, error: 'Invalid stage' };
+    // 'Day Off' is a valid stage — the kiosk, Add Punch and the voice supervisor
+    // all write it. Omitting it here meant an admin could not amend a Day Off
+    // row through this path ("Invalid stage").
+    if (!['Check In','Break Out','Break In','Check Out','Day Off'].includes(stage)) return { success: false, error: 'Invalid stage' };
 
     const targetDate = parseFlexibleDate_(dateInput);
     if (!targetDate) return { success: false, error: 'date must be a valid date (dd-mm-yyyy)' };

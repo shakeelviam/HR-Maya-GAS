@@ -51,10 +51,11 @@ function generatePayrollDocs(params) {
       bonus: c('Bonus'), gross: c('Gross Salary'), otHrs: c('OT Hours'),
       rate: c('Price Per Hour'), otAmt: c('OT Amount'),
       encDays: c('Encash Days'), enc: c('Encashment'), ded: c('Deductions'),
-      remark: c('Deduction Remark'), pay: c('Total Payable'), flags: c('Flags'),
+      remark: (c('Deduction Remark') !== -1 ? c('Deduction Remark') : c('Remark')), pay: c('Total Payable'), flags: c('Flags'),
       // New itemised review-tab columns (present when run from the Payroll Review screen)
       bonusAdd: c('Bonus/Additional'), unpaid: c('Unpaid Leave'), loan: c('Loan'),
-      advance: c('Advance'), disc: c('Disciplinary'), totDed: c('Total Deductions'), net: c('Net Payable')
+      advance: c('Advance'), disc: c('Disciplinary'), sched: c('Scheduled Deductions'),
+      totDed: c('Total Deductions'), net: c('Net Payable')
     };
 
     // Collect employee rows (skip the TOTALS row, which has a blank Employee ID).
@@ -71,11 +72,11 @@ function generatePayrollDocs(params) {
     // Period label from the tab name if we didn't get it from control.
     const periodLabel = (periodStart && periodEnd) ? (periodStart + ' to ' + periodEnd) : tabName.replace(/^Payroll\s*/, '');
 
-    // Build one HTML doc: A5 summary page + one A5 payslip per employee.
-    const html = buildPayrollHtml_(tabName, periodLabel, emps, totals, idx);
-
-    // Convert HTML -> single PDF (A5 honored via @page).
-    const pdfBlob = Utilities.newBlob(html, 'text/html', tabName + '.html').getAs('application/pdf')
+    // Build a temporary Google Doc with A5 pages (summary + one payslip per
+    // page) and export it as the PDF. Apps Script's HTML→PDF converter
+    // ignores @page size and always prints A4, so the page size is set on
+    // the Doc itself, where it is exact.
+    const pdfBlob = buildPayrollPdfA5_(tabName, periodLabel, emps, totals, idx)
                     .setName(tabName + ' — Payslips.pdf');
 
     // Save to a Drive folder, overwriting any previous PDF for this tab.
@@ -95,6 +96,165 @@ function generatePayrollDocs(params) {
   } catch (err) {
     return { success: false, error: err.toString() };
   }
+}
+
+// Run from the Apps Script editor (Run ▶ runPayslipsLatest) to make the
+// payslip PDF for the most recent payroll run and see the result — or the
+// real error — in the Execution log. Same as the Generate button.
+function runPayslipsLatest() {
+  const r = generatePayrollDocs({});
+  Logger.log(r.success ? (r.message + '\n' + r.pdfUrl) : ('ERROR: ' + r.error));
+  return r;
+}
+
+// ------------------------------------------------------------
+// A5 PDF via a temporary Google Doc.
+// A5 = 148 × 210 mm = 419.53 × 595.28 pt. Margins 10 mm (28.35 pt).
+// ------------------------------------------------------------
+const A5_W = 419.53, A5_H = 595.28, A5_M = 28.35;
+const SLIP_NAVY = '#1e3a5f';
+
+function buildPayrollPdfA5_(tabName, periodLabel, emps, totals, idx) {
+  const g = (row, key) => (idx[key] !== -1 ? row[idx[key]] : '');
+  const payOf = (row) => (idx.net !== -1 && g(row,'net') !== '') ? g(row,'net') : g(row,'pay');
+  const dedOf = (row) => (idx.totDed !== -1 && g(row,'totDed') !== '') ? g(row,'totDed') : g(row,'ded');
+  const A = DocumentApp.Attribute, H = DocumentApp.HorizontalAlignment;
+  const txt = (el, size, bold, color, italic) => {
+    const st = {}; st[A.FONT_FAMILY] = 'Arial'; st[A.FONT_SIZE] = size; st[A.BOLD] = !!bold;
+    st[A.ITALIC] = !!italic; st[A.FOREGROUND_COLOR] = color || '#1a1a1a';
+    const t = el.editAsText();
+    if (t.getText().length) t.setAttributes(st);   // nothing to style in an empty cell
+    return el;
+  };
+  const para = (body, text, size, bold, color, align, italic) => {
+    const p = body.appendParagraph(text || '');
+    p.setSpacingBefore(0); p.setSpacingAfter(2); p.setLineSpacing(1);
+    if (align) p.setAlignment(align);
+    if (text) txt(p, size, bold, color, italic);
+    return p;
+  };
+  const styleCell = (cell, size, bold, color, bg, right) => {
+    cell.setPaddingTop(2).setPaddingBottom(2).setPaddingLeft(4).setPaddingRight(4);
+    if (bg) cell.setBackgroundColor(bg);
+    txt(cell, size, bold, color);
+    if (right) cell.getChild(0).asParagraph().setAlignment(H.RIGHT);
+    const p = cell.getChild(0).asParagraph(); p.setSpacingBefore(0); p.setSpacingAfter(0);
+  };
+  const header = (body, title) => {
+    para(body, 'MAYA TEX RESTAURANTS COMPANY', 12, true, SLIP_NAVY, H.CENTER);
+    para(body, title, 9, false, '#555555', H.CENTER);
+  };
+
+  const doc = DocumentApp.create('tmp payslips ' + tabName + ' ' + new Date().getTime());
+  const body = doc.getBody();
+  body.setPageWidth(A5_W).setPageHeight(A5_H)
+      .setMarginTop(A5_M).setMarginBottom(A5_M).setMarginLeft(A5_M).setMarginRight(A5_M);
+  const inner = A5_W - 2 * A5_M;
+
+  // --- Summary (flows over as many A5 pages as it needs) ---
+  const first = body.getChild(0).asParagraph();
+  first.setText('MAYA TEX RESTAURANTS COMPANY'); first.setAlignment(H.CENTER);
+  first.setSpacingBefore(0); first.setSpacingAfter(2); txt(first, 12, true, SLIP_NAVY);
+  para(body, 'Payroll Summary — ' + periodLabel, 9, false, '#555555', H.CENTER);
+  const sRows = [['ID', 'Name', 'Gross', 'OT', 'Deduct', 'Net']];
+  emps.forEach(r => sRows.push([String(g(r,'id')), String(g(r,'name')), money_(g(r,'gross')),
+    money_(g(r,'otAmt')), money_(dedOf(r)), money_(payOf(r))]));
+  sRows.push(['', 'TOTALS (' + emps.length + ' staff)', totals ? money_(g(totals,'gross')) : '',
+    totals ? money_(g(totals,'otAmt')) : '', totals ? money_(dedOf(totals)) : '', totals ? money_(payOf(totals)) : '']);
+  const st = body.appendTable(sRows);
+  st.setBorderWidth(0.5).setBorderColor('#cccccc');
+  [48, 136, 44, 40, 44, 50].forEach((w, j) => st.setColumnWidth(j, w * inner / 362));
+  for (let i = 0; i < sRows.length; i++) {
+    const hdr = i === 0, tot = i === sRows.length - 1;
+    for (let j = 0; j < 6; j++) styleCell(st.getRow(i).getCell(j), 7, hdr || tot || j === 5,
+      hdr ? '#ffffff' : null, hdr ? SLIP_NAVY : (tot ? '#f2f4f7' : null), j >= 2);
+  }
+  para(body, 'All amounts in Kuwaiti Dinar (KD), to 3 decimals. Generated ' + formatDdMmYyyy_(new Date()) + '.',
+       7, false, '#777777');
+
+  // --- One A5 page per employee ---
+  emps.forEach(r => {
+    body.appendPageBreak();
+    const pay = Number(payOf(r)) || 0;
+    const otHrs = g(r,'otHrs'), remark = g(r,'remark'), flags = g(r,'flags');
+    const lines = [['Description', 'Amount (KD)', 'head']];
+    lines.push(['Basic Salary', money_(g(r,'basic'))]);
+    if (Number(g(r,'food')))  lines.push(['Food Allowance', money_(g(r,'food'))]);
+    if (Number(g(r,'accom'))) lines.push(['Accommodation', money_(g(r,'accom'))]);
+    if (Number(g(r,'conv')))  lines.push(['Conveyance', money_(g(r,'conv'))]);
+    if (Number(g(r,'bonus'))) lines.push(['Bonus', money_(g(r,'bonus'))]);
+    lines.push(['Gross Salary', money_(g(r,'gross')), 'sub']);
+    if (Number(otHrs)) lines.push(['Overtime (' + otHrs + ' hrs @ ' + money_(g(r,'rate')) + ')', money_(g(r,'otAmt'))]);
+    if (Number(g(r,'enc'))) lines.push(['Leave Encashment (' + (g(r,'encDays') || 0) + ' days)', money_(g(r,'enc'))]);
+    if (idx.bonusAdd !== -1 && Number(g(r,'bonusAdd'))) lines.push(['Bonus / Additional', money_(g(r,'bonusAdd'))]);
+    if (idx.totDed !== -1) {
+      if (Number(g(r,'unpaid')))  lines.push(['Unpaid leave / absence', '(' + money_(g(r,'unpaid')) + ')']);
+      if (Number(g(r,'loan')))    lines.push(['Loan', '(' + money_(g(r,'loan')) + ')']);
+      if (Number(g(r,'advance'))) lines.push(['Advance', '(' + money_(g(r,'advance')) + ')']);
+      if (Number(g(r,'disc')))    lines.push(['Disciplinary', '(' + money_(g(r,'disc')) + ')']);
+      if (idx.sched !== -1 && Number(g(r,'sched'))) lines.push(['Scheduled deductions', '(' + money_(g(r,'sched')) + ')']);
+    } else if (Number(g(r,'ded'))) {
+      lines.push(['Deductions', '(' + money_(g(r,'ded')) + ')']);
+    }
+    lines.push(['NET PAYABLE', money_(pay), 'net']);
+
+    // Fill the A5 page. A slip with few lines gets big type, a long one
+    // smaller, so every slip uses the sheet instead of sitting in the top
+    // third of it. Worst case (16 lines) still fits on one page.
+    // Sizes measured against the A5 text area (539 pt): every band lands
+    // between 82% and 93% of the page, so nothing spills to a second page
+    // even when a long Details line wraps.
+    const n = lines.length;
+    const fs    = n <= 7 ? 16 : n <= 9 ? 14 : n <= 11 ? 13 : n <= 13 ? 12 : n <= 16 ? 11 : 10;
+    const pad   = n <= 7 ?  9 : n <= 9 ?  8 : n <= 11 ?  7 : n <= 13 ?  6 : n <= 16 ?  5 :  4;
+    const hdrFs = n <= 7 ? 20 : n <= 9 ? 18 : n <= 13 ? 17 : 15;
+
+    const hp = body.appendParagraph('MAYA TEX RESTAURANTS COMPANY');
+    hp.setAlignment(H.CENTER); hp.setSpacingBefore(0); hp.setSpacingAfter(2); txt(hp, hdrFs, true, SLIP_NAVY);
+    para(body, 'Salary Slip — ' + periodLabel, fs, false, '#555555', H.CENTER);
+
+    const meta = body.appendTable([['Employee', 'Employee ID'], [String(g(r,'name')), String(g(r,'id'))]]);
+    meta.setBorderWidth(0);
+    for (let i = 0; i < 2; i++) for (let j = 0; j < 2; j++) {
+      const c = meta.getRow(i).getCell(j);
+      styleCell(c, i ? fs + 1 : fs - 2, !!i, i ? null : '#777777', null, j === 1);
+      c.setPaddingTop(i ? 1 : pad).setPaddingBottom(1);
+    }
+
+    const t = body.appendTable(lines.map(l => [l[0], l[1]]));
+    t.setBorderWidth(0.5).setBorderColor('#cccccc');
+    t.setColumnWidth(0, inner * 0.68); t.setColumnWidth(1, inner * 0.32);
+    lines.forEach((l, i) => {
+      const kind = l[2];
+      for (let j = 0; j < 2; j++) {
+        const c = t.getRow(i).getCell(j);
+        styleCell(c, kind === 'net' ? fs + 2 : fs, !!kind, kind === 'head' ? '#ffffff' : null,
+          kind === 'head' ? SLIP_NAVY : (kind === 'sub' ? '#f7f9fc' : (kind === 'net' ? '#f2f4f7' : null)), j === 1);
+        c.setPaddingTop(pad).setPaddingBottom(pad);
+      }
+    });
+
+    para(body, words_(pay), fs - 1, false, '#1a1a1a', null, true).setSpacingBefore(pad);
+    if (remark) para(body, 'Details: ' + remark, fs - 2, false, '#555555');
+    if (flags) para(body, 'Note: ' + flags, fs - 2, false, '#bb0000');
+    // Push the signature block down the page so the slip ends at the foot
+    // of the A5 sheet rather than floating in the middle of it.
+    const gaps = n <= 5 ? 6 : n <= 7 ? 3 : n <= 9 ? 2 : n <= 11 ? 1 : 0;
+    for (let i = 0; i < gaps; i++) para(body, '', fs);
+    const sig = body.appendTable([['______________________', '______________________', '______________________'],
+                                  ['Received (Employee)', 'Prepared (HR)', 'Approved']]);
+    sig.setBorderWidth(0);
+    for (let i = 0; i < 2; i++) for (let j = 0; j < 3; j++) {
+      styleCell(sig.getRow(i).getCell(j), fs - 2, false, '#555555');
+      sig.getRow(i).getCell(j).getChild(0).asParagraph().setAlignment(H.CENTER);
+    }
+  });
+
+  doc.saveAndClose();
+  const file = DriveApp.getFileById(doc.getId());
+  const pdf = file.getAs('application/pdf');
+  file.setTrashed(true);   // the Doc was only a vehicle for the PDF
+  return pdf;
 }
 
 function getOrCreateFolder_(name) {
@@ -123,118 +283,4 @@ function words_(amount) {
   t = t.trim() + (dinars === 1 ? ' Kuwaiti Dinar' : ' Kuwaiti Dinars');
   if (fils > 0) t += ' and ' + String(fils).padStart(3, '0') + ' Fils';
   return t + ' only';
-}
-
-function buildPayrollHtml_(tabName, periodLabel, emps, totals, idx) {
-  const g = (row, key) => (idx[key] !== -1 ? row[idx[key]] : '');
-
-  // --- Summary page ---
-  let summaryRows = '';
-  emps.forEach((r) => {
-    summaryRows +=
-      '<tr><td>' + esc_(g(r,'id')) + '</td><td>' + esc_(g(r,'name')) + '</td>' +
-      '<td class="r">' + money_(g(r,'gross')) + '</td>' +
-      '<td class="r">' + money_(g(r,'otAmt')) + '</td>' +
-      '<td class="r">' + money_(g(r,'ded')) + '</td>' +
-      '<td class="r b">' + money_(g(r,'pay')) + '</td></tr>';
-  });
-  const tG = totals ? money_(g(totals,'gross')) : '';
-  const tO = totals ? money_(g(totals,'otAmt')) : '';
-  const tD = totals ? money_(g(totals,'ded')) : '';
-  const tP = totals ? money_((idx.net !== -1 && g(totals,'net') !== '') ? g(totals,'net') : g(totals,'pay')) : '';
-
-  let summaryPage =
-    '<section class="page">' +
-      '<div class="co">MAYA TEX RESTAURANTS COMPANY</div>' +
-      '<div class="sub">Payroll Summary — ' + esc_(periodLabel) + '</div>' +
-      '<table class="grid"><thead><tr>' +
-        '<th>ID</th><th>Name</th><th class="r">Gross</th><th class="r">OT</th><th class="r">Deduct</th><th class="r">Net Payable</th>' +
-      '</tr></thead><tbody>' + summaryRows +
-      '<tr class="tot"><td></td><td>TOTALS (' + emps.length + ' staff)</td>' +
-        '<td class="r">' + tG + '</td><td class="r">' + tO + '</td><td class="r">' + tD + '</td><td class="r b">' + tP + '</td></tr>' +
-      '</tbody></table>' +
-      '<div class="note">All amounts in Kuwaiti Dinar (KD), to 3 decimals. Generated ' + formatDdMmYyyy_(new Date()) + '.</div>' +
-    '</section>';
-
-  // --- One payslip per employee ---
-  let slips = '';
-  emps.forEach((r) => {
-    const pay = (idx.net !== -1 && g(r,'net') !== '') ? (Number(g(r,'net')) || 0) : (Number(g(r,'pay')) || 0);
-    const otHrs = g(r,'otHrs');
-    const remark = g(r,'remark');
-    const flags = g(r,'flags');
-    const lines = [];
-    lines.push(['Basic Salary', money_(g(r,'basic'))]);
-    if (Number(g(r,'food')))  lines.push(['Food Allowance', money_(g(r,'food'))]);
-    if (Number(g(r,'accom'))) lines.push(['Accommodation', money_(g(r,'accom'))]);
-    if (Number(g(r,'conv')))  lines.push(['Conveyance', money_(g(r,'conv'))]);
-    if (Number(g(r,'bonus'))) lines.push(['Bonus', money_(g(r,'bonus'))]);
-    lines.push(['Gross Salary', money_(g(r,'gross')), 'sub']);
-    if (Number(otHrs)) lines.push(['Overtime (' + otHrs + ' hrs @ ' + money_(g(r,'rate')) + ')', money_(g(r,'otAmt'))]);
-    if (Number(g(r,'enc'))) lines.push(['Leave Encashment (' + (g(r,'encDays') || 0) + ' days)', money_(g(r,'enc'))]);
-    // Bonus/Additional (itemised review tab)
-    if (idx.bonusAdd !== -1 && Number(g(r,'bonusAdd'))) lines.push(['Bonus / Additional', money_(g(r,'bonusAdd'))]);
-    // Itemised deductions when the review-tab columns exist; else the single 'Deductions'.
-    const hasItemised = idx.totDed !== -1;
-    if (hasItemised) {
-      if (Number(g(r,'unpaid')))  lines.push(['Unpaid Leave' + (remark ? ' (' + esc_(remark) + ')' : ''), '(' + money_(g(r,'unpaid')) + ')']);
-      if (Number(g(r,'loan')))    lines.push(['Loan', '(' + money_(g(r,'loan')) + ')']);
-      if (Number(g(r,'advance'))) lines.push(['Advance', '(' + money_(g(r,'advance')) + ')']);
-      if (Number(g(r,'disc')))    lines.push(['Disciplinary', '(' + money_(g(r,'disc')) + ')']);
-    } else if (Number(g(r,'ded'))) {
-      lines.push(['Deductions' + (remark ? ' (' + esc_(remark) + ')' : ''), '(' + money_(g(r,'ded')) + ')']);
-    }
-
-    let body = '';
-    lines.forEach(l => {
-      const cls = l[2] === 'sub' ? ' class="subrow"' : '';
-      body += '<tr' + cls + '><td>' + esc_(l[0]) + '</td><td class="r">' + l[1] + '</td></tr>';
-    });
-
-    slips +=
-      '<section class="page">' +
-        '<div class="co">MAYA TEX RESTAURANTS COMPANY</div>' +
-        '<div class="sub">Salary Slip — ' + esc_(periodLabel) + '</div>' +
-        '<table class="meta"><tr>' +
-          '<td><span class="lbl">Employee</span><br><b>' + esc_(g(r,'name')) + '</b></td>' +
-          '<td><span class="lbl">Employee ID</span><br><b>' + esc_(g(r,'id')) + '</b></td>' +
-        '</tr></table>' +
-        '<table class="grid slip"><thead><tr><th>Description</th><th class="r">Amount (KD)</th></tr></thead>' +
-          '<tbody>' + body +
-          '<tr class="net"><td>NET PAYABLE</td><td class="r">' + money_(pay) + '</td></tr>' +
-          '</tbody></table>' +
-        '<div class="words"><i>' + esc_(words_(pay)) + '</i></div>' +
-        (flags ? '<div class="flag">Note: ' + esc_(flags) + '</div>' : '') +
-        '<table class="sig"><tr><td>______________________<br>Received (Employee)</td>' +
-          '<td>______________________<br>Prepared (HR)</td>' +
-          '<td>______________________<br>Approved</td></tr></table>' +
-      '</section>';
-  });
-
-  const css =
-    '@page { size: A5; margin: 10mm; }' +
-    '* { font-family: Arial, Helvetica, sans-serif; box-sizing: border-box; }' +
-    'body { margin: 0; color: #1a1a1a; font-size: 10px; }' +
-    '.page { page-break-after: always; }' +
-    '.page:last-child { page-break-after: auto; }' +
-    '.co { text-align: center; font-size: 13px; font-weight: bold; color: #1e3a5f; }' +
-    '.sub { text-align: center; font-size: 10px; color: #555; border-bottom: 1.5px solid #1e3a5f; padding-bottom: 5px; margin-bottom: 8px; }' +
-    'table { width: 100%; border-collapse: collapse; }' +
-    '.meta td { padding: 3px 0; font-size: 9px; }' +
-    '.lbl { color: #777; font-size: 8px; }' +
-    '.grid th { background: #1e3a5f; color: #fff; text-align: left; padding: 4px 6px; font-size: 9px; }' +
-    '.grid td { padding: 4px 6px; border-bottom: 0.5px solid #ccc; }' +
-    '.r { text-align: right; } .b { font-weight: bold; }' +
-    '.subrow td { font-weight: bold; background: #f7f9fc; }' +
-    '.net td { font-weight: bold; font-size: 11px; background: #f2f4f7; border-top: 1.5px solid #1e3a5f; }' +
-    '.slip { margin-top: 6px; }' +
-    '.words { margin-top: 6px; font-size: 9px; }' +
-    '.flag { margin-top: 4px; font-size: 8px; color: #b00; }' +
-    '.tot td { font-weight: bold; background: #f2f4f7; border-top: 1.5px solid #1e3a5f; }' +
-    '.sig { margin-top: 22px; text-align: center; font-size: 8px; color: #555; }' +
-    '.sig td { padding-top: 14px; }' +
-    '.note { margin-top: 8px; font-size: 8px; color: #777; }';
-
-  return '<!DOCTYPE html><html><head><meta charset="utf-8"><style>' + css + '</style></head><body>' +
-         summaryPage + slips + '</body></html>';
 }

@@ -121,40 +121,22 @@ function getManualAttendance(params) {
   } catch (err) { return { success: false, error: err.toString() }; }
 }
 
-// Absent-day deductions for a payroll period (Basic/26 x absent days).
-// Read by the Payroll Review so Absent → unpaid deduction. Day Off is paid.
-// Returns { empId: { absentDays, amount, note } }
-function getAbsenceDeductionsForPeriod_(ss, periodStart, periodEnd) {
-  const out = {};
-  const sheet = ss.getSheetByName(MANUAL_ATTN_TAB);
-  if (!sheet) return out;
-  const d = sheet.getDataRange().getValues();
-  const hr = ss.getSheetByName('HR Maya');
-  const hd = hr.getDataRange().getValues();
-  const H = hd[0];
-  const cId = H.findIndex(h => String(h).trim().toLowerCase() === 'employee id');
-  const cBasic = H.findIndex(h => String(h).trim().toLowerCase() === 'basic salary');
-  const basicById = {};
-  for (let i = 1; i < hd.length; i++) {
-    const id = String(hd[i][cId] || '').trim();
-    if (id) basicById[id] = Number(hd[i][cBasic]) || 0;
-  }
-  for (let i = 1; i < d.length; i++) {
-    const id = String(d[i][0] || '').trim();
-    const dt = parseFlexibleDate_(d[i][4]);
-    const status = String(d[i][5] || '').trim().toLowerCase();
-    if (!id || !dt || status !== 'absent') continue;
-    if (dt < startOfDay_(periodStart) || dt > endOfDay_(periodEnd)) continue;
-    if (!out[id]) out[id] = { absentDays: 0, amount: 0, note: '' };
-    out[id].absentDays++;
-  }
-  Object.keys(out).forEach(id => {
-    const daily = KD((basicById[id] || 0) / 26);
-    out[id].amount = KD(daily * out[id].absentDays);
-    out[id].note = 'Absent: ' + out[id].absentDays + ' day(s)';
-  });
-  return out;
-}
+// NOTE: getAbsenceDeductionsForPeriod_ used to be defined HERE, reading
+// Manual_Attendance_Aug. It has been REMOVED.
+//
+// Apps Script shares ONE global namespace across every .gs file, so having
+// two functions with this name — this one, and the Attendance_Daily version
+// in AbsenceDeductions.gs — meant whichever file loaded last silently won.
+// Absence deductions therefore depended on file load order, which is not
+// something you control. If this version won, only Aug 22-31 backfill rows
+// produced deductions and everything from September onward deducted nothing.
+//
+// Attendance_Daily is now the SINGLE SOURCE OF TRUTH for attendance.
+// The live definition lives in AbsenceDeductions.gs.
+//
+// Manual_Attendance_Aug is still the input for the Aug 22-31 supervisor
+// backfill: writeDayToAttendanceDaily_ reads it as priority 1 and folds those
+// rows into Attendance_Daily, so they still count — through one path, not two.
 
 // One-time: mark Head Office staff Present for 22–30 Aug 2026, skipping
 // their weekly off (Fri/Sat). Writes into Manual_Attendance_Aug (latest-wins).

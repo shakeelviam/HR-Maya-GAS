@@ -18,6 +18,22 @@ const PAYROLL_SPREADSHEET_ID = '1QMYgO6B8fciT6pObX9PB3Nmc8TvqOAAYsYQF4bve69M';
 function doGet(e) { return handleRequest(e); }
 function doPost(e) { return handleRequest(e); }
 
+// Parameters for an endpoint that may be called either way.
+// A POST body wins when there is one — that is how a bulk action sends a
+// list of ids without pushing them through a URL. Falls back to the query
+// string so the same endpoint still works from a browser address bar.
+function cgBody_(e) {
+  try {
+    if (e && e.postData && e.postData.contents) {
+      const b = JSON.parse(e.postData.contents);
+      // Keep method= and anything else that only came on the query string.
+      if (e.parameter) { Object.keys(e.parameter).forEach(k => { if (!(k in b)) b[k] = e.parameter[k]; }); }
+      return b;
+    }
+  } catch (err) { /* malformed body — fall through to the query string */ }
+  return (e && e.parameter) ? e.parameter : {};
+}
+
 function handleRequest(e) {
   try {
     const method = e.parameter.method || 'getIntegratedEmployees';
@@ -134,6 +150,37 @@ function handleRequest(e) {
         return ContentService.createTextOutput(JSON.stringify(editAttendancePunch((e.postData && e.postData.contents) ? JSON.parse(e.postData.contents) : e.parameter))).setMimeType(ContentService.MimeType.JSON);
       case 'deleteAttendancePunch':
         return ContentService.createTextOutput(JSON.stringify(deleteAttendancePunch(e.parameter))).setMimeType(ContentService.MimeType.JSON);
+      // ============================================================
+      // 🧾 OT VERIFICATION CONSOLE (functions in OtCompile.gs)
+      // Separate role from supervisor — allowlist in Admin_Settings
+      // under the key 'ot_compilers'.
+      // ============================================================
+      // ============================================================
+      // ✅ SUPERVISOR VERIFICATION (functions in SupervisorVerify.gs)
+      // Supervisors confirm OT claims and unresolved attendance days for
+      // their own location. Verdicts are recorded, not applied — the OT
+      // compiler still decides, but with a statement attached.
+      // ============================================================
+      case 'getSupervisorVerifyList':
+        // Proves who is looking (PIN) and hides his own days from him.
+        return ContentService.createTextOutput(JSON.stringify(svWebList(cgBody_(e)))).setMimeType(ContentService.MimeType.JSON);
+      case 'getRosterOverview':
+        // Every location's roster, read-only, for the HR admin page.
+        return ContentService.createTextOutput(JSON.stringify(getRosterOverview(e.parameter))).setMimeType(ContentService.MimeType.JSON);
+      case 'svRoles':
+        return ContentService.createTextOutput(JSON.stringify(svRoles())).setMimeType(ContentService.MimeType.JSON);
+      case 'saveSupervisorVerdicts':
+        return ContentService.createTextOutput(JSON.stringify(saveSupervisorVerdicts((e.postData && e.postData.contents) ? JSON.parse(e.postData.contents) : e.parameter))).setMimeType(ContentService.MimeType.JSON);
+
+      case 'getOtCompileList':
+        return ContentService.createTextOutput(JSON.stringify(getOtCompileList(e.parameter))).setMimeType(ContentService.MimeType.JSON);
+      case 'previewOtDateFix':
+        return ContentService.createTextOutput(JSON.stringify(previewOtDateFix(cgBody_(e)))).setMimeType(ContentService.MimeType.JSON);
+      case 'commitOtDateFix':
+        return ContentService.createTextOutput(JSON.stringify(commitOtDateFix(cgBody_(e)))).setMimeType(ContentService.MimeType.JSON);
+      case 'postApprovedOt':
+        return ContentService.createTextOutput(JSON.stringify(postApprovedOt((e.postData && e.postData.contents) ? JSON.parse(e.postData.contents) : e.parameter))).setMimeType(ContentService.MimeType.JSON);
+
       case 'previewMissingCheckouts':
         return ContentService.createTextOutput(JSON.stringify(previewMissingCheckouts(e.parameter))).setMimeType(ContentService.MimeType.JSON);
       case 'commitMissingCheckouts':
@@ -180,8 +227,23 @@ function handleRequest(e) {
       // ============================================================
       case 'getAttendanceOtDraft':
         return ContentService.createTextOutput(JSON.stringify(getAttendanceOtDraft(e.parameter))).setMimeType(ContentService.MimeType.JSON);
-      case 'postOtToEntries':
-        return ContentService.createTextOutput(JSON.stringify(postOtToEntries((e.postData && e.postData.contents) ? JSON.parse(e.postData.contents) : e.parameter))).setMimeType(ContentService.MimeType.JSON);
+      case 'postOtToEntries': {
+        // What is already in OT_Entries for a man and day stands — never post it twice.
+        const g = otGuardPostEntries((e.postData && e.postData.contents) ? JSON.parse(e.postData.contents) : e.parameter);
+        let res;
+        if (!g.body.rows || !g.body.rows.length) {
+          res = { success: true, posted: 0, skipped: g.skipped,
+                  message: 'Nothing posted — every ticked row is already in OT_Entries.' };
+        } else {
+          res = postOtToEntries(g.body);
+          if (res && g.skipped.length) {
+            res.skipped = g.skipped;
+            res.message = (res.message || '') + ' ' + g.skipped.length +
+                          ' skipped — already in OT_Entries: ' + g.skipped.join('; ');
+          }
+        }
+        return ContentService.createTextOutput(JSON.stringify(res)).setMimeType(ContentService.MimeType.JSON);
+      }
       case 'scrubAttendancePins':
         return ContentService.createTextOutput(JSON.stringify(scrubAttendancePins())).setMimeType(ContentService.MimeType.JSON);
       case 'archiveOtEntriesNow':
@@ -242,10 +304,101 @@ function handleRequest(e) {
         return ContentService.createTextOutput(JSON.stringify(saveScheduledDeduction((e.postData && e.postData.contents) ? JSON.parse(e.postData.contents) : e.parameter))).setMimeType(ContentService.MimeType.JSON);
       case 'cancelScheduledDeduction':
         return ContentService.createTextOutput(JSON.stringify(cancelScheduledDeduction(e.parameter))).setMimeType(ContentService.MimeType.JSON);
+      // ── Recruitment (Recruitment.gs) ────────────────────────────
+      case 'getRecruitment':
+        return ContentService.createTextOutput(JSON.stringify(getRecruitment(e.parameter))).setMimeType(ContentService.MimeType.JSON);
+      case 'saveCandidate':
+        return ContentService.createTextOutput(JSON.stringify(saveCandidate(((e.postData && e.postData.contents) ? JSON.parse(e.postData.contents) : e.parameter)))).setMimeType(ContentService.MimeType.JSON);
+      case 'setCandidateStage':
+        return ContentService.createTextOutput(JSON.stringify(setCandidateStage(((e.postData && e.postData.contents) ? JSON.parse(e.postData.contents) : e.parameter)))).setMimeType(ContentService.MimeType.JSON);
+      case 'convertCandidateToEmployee':
+        return ContentService.createTextOutput(JSON.stringify(convertCandidateToEmployee(((e.postData && e.postData.contents) ? JSON.parse(e.postData.contents) : e.parameter)))).setMimeType(ContentService.MimeType.JSON);
+      case 'issueAgencyPin':
+        return ContentService.createTextOutput(JSON.stringify(issueAgencyPin(((e.postData && e.postData.contents) ? JSON.parse(e.postData.contents) : e.parameter)))).setMimeType(ContentService.MimeType.JSON);
+      case 'revokeAgencyPin':
+        return ContentService.createTextOutput(JSON.stringify(revokeAgencyPin(((e.postData && e.postData.contents) ? JSON.parse(e.postData.contents) : e.parameter)))).setMimeType(ContentService.MimeType.JSON);
+      case 'checkAgencyLogin':
+        return ContentService.createTextOutput(JSON.stringify(checkAgencyLogin(((e.postData && e.postData.contents) ? JSON.parse(e.postData.contents) : e.parameter)))).setMimeType(ContentService.MimeType.JSON);
+      case 'agentCandidates':
+        return ContentService.createTextOutput(JSON.stringify(agentCandidates(((e.postData && e.postData.contents) ? JSON.parse(e.postData.contents) : e.parameter)))).setMimeType(ContentService.MimeType.JSON);
+      case 'agentAddCandidate':
+        return ContentService.createTextOutput(JSON.stringify(agentAddCandidate(((e.postData && e.postData.contents) ? JSON.parse(e.postData.contents) : e.parameter)))).setMimeType(ContentService.MimeType.JSON);
+      // ── QR terminal check-in (QrPunch.gs) ─────────────────────────
+      // The tablet shows a rotating code; the phone scans it; the tablet
+      // shows the stage page and takes the punch.
+      case 'pairTerminal':
+        return ContentService.createTextOutput(JSON.stringify(pairTerminal(((e.postData && e.postData.contents) ? JSON.parse(e.postData.contents) : e.parameter)))).setMimeType(ContentService.MimeType.JSON);
+      case 'terminalCodes':
+        return ContentService.createTextOutput(JSON.stringify(terminalCodes(((e.postData && e.postData.contents) ? JSON.parse(e.postData.contents) : e.parameter)))).setMimeType(ContentService.MimeType.JSON);
+      case 'issueBadge':
+        return ContentService.createTextOutput(JSON.stringify(issueBadge(((e.postData && e.postData.contents) ? JSON.parse(e.postData.contents) : e.parameter)))).setMimeType(ContentService.MimeType.JSON);
+      case 'badgeByLink':
+        return ContentService.createTextOutput(JSON.stringify(badgeByLink(((e.postData && e.postData.contents) ? JSON.parse(e.postData.contents) : e.parameter)))).setMimeType(ContentService.MimeType.JSON);
+      case 'badgeIdentify':
+        return ContentService.createTextOutput(JSON.stringify(badgeIdentify(((e.postData && e.postData.contents) ? JSON.parse(e.postData.contents) : e.parameter)))).setMimeType(ContentService.MimeType.JSON);
+      case 'revokeBadge':
+        return ContentService.createTextOutput(JSON.stringify(revokeBadge(((e.postData && e.postData.contents) ? JSON.parse(e.postData.contents) : e.parameter)))).setMimeType(ContentService.MimeType.JSON);
+      case 'qrScan':
+        return ContentService.createTextOutput(JSON.stringify(qrScan(((e.postData && e.postData.contents) ? JSON.parse(e.postData.contents) : e.parameter)))).setMimeType(ContentService.MimeType.JSON);
+      case 'terminalPoll':
+        return ContentService.createTextOutput(JSON.stringify(terminalPoll(((e.postData && e.postData.contents) ? JSON.parse(e.postData.contents) : e.parameter)))).setMimeType(ContentService.MimeType.JSON);
+      case 'terminalPunch':
+        return ContentService.createTextOutput(JSON.stringify(terminalPunch(((e.postData && e.postData.contents) ? JSON.parse(e.postData.contents) : e.parameter)))).setMimeType(ContentService.MimeType.JSON);
+      case 'listTerminals':
+        return ContentService.createTextOutput(JSON.stringify(listTerminals(e.parameter))).setMimeType(ContentService.MimeType.JSON);
+      case 'revokeTerminal':
+        return ContentService.createTextOutput(JSON.stringify(revokeTerminal(((e.postData && e.postData.contents) ? JSON.parse(e.postData.contents) : e.parameter)))).setMimeType(ContentService.MimeType.JSON);
+
+      case 'saveAgency':
+        return ContentService.createTextOutput(JSON.stringify(saveAgency(((e.postData && e.postData.contents) ? JSON.parse(e.postData.contents) : e.parameter)))).setMimeType(ContentService.MimeType.JSON);
+
+      // Scheduled extras — bonuses etc. (ScheduledExtras.gs)
+      case 'getScheduledExtras':
+        return ContentService.createTextOutput(JSON.stringify(getScheduledExtras(e.parameter))).setMimeType(ContentService.MimeType.JSON);
+      case 'saveScheduledExtra':
+        return ContentService.createTextOutput(JSON.stringify(saveScheduledExtra((e.postData && e.postData.contents) ? JSON.parse(e.postData.contents) : e.parameter))).setMimeType(ContentService.MimeType.JSON);
+      case 'cancelScheduledExtra':
+        return ContentService.createTextOutput(JSON.stringify(cancelScheduledExtra(e.parameter))).setMimeType(ContentService.MimeType.JSON);
+
+      // ============================================================
+      // 🏢 PAYROLL BY BRANCH (PayrollByBranch.gs)
+      // ============================================================
+      case 'buildPayrollByBranch':
+        return ContentService.createTextOutput(JSON.stringify(buildPayrollByBranch(((e.postData && e.postData.contents) ? JSON.parse(e.postData.contents) : e.parameter)))).setMimeType(ContentService.MimeType.JSON);
+
+      // ============================================================
+      // 📄 DOCUMENT EXPIRY CHASE (DocExpiryAlert.gs)
+      // ============================================================
+      case 'getDocChaseList':
+        return ContentService.createTextOutput(JSON.stringify(getDocChaseList(e.parameter))).setMimeType(ContentService.MimeType.JSON);
+      case 'makeMyDocsLink':
+        return ContentService.createTextOutput(JSON.stringify(makeMyDocsLink(e.parameter))).setMimeType(ContentService.MimeType.JSON);
+      case 'getMyDocuments':
+        return ContentService.createTextOutput(JSON.stringify(getMyDocuments(e.parameter))).setMimeType(ContentService.MimeType.JSON);
+
+      // ============================================================
+      // ✈️ LEAVE SALARY — paid in advance, by voucher (LeaveSalary.gs)
+      // ============================================================
+      case 'getLeaveSalaryList':
+        return ContentService.createTextOutput(JSON.stringify(getLeaveSalaryList(e.parameter))).setMimeType(ContentService.MimeType.JSON);
+      case 'payLeaveSalary':
+        return ContentService.createTextOutput(JSON.stringify(payLeaveSalary(((e.postData && e.postData.contents) ? JSON.parse(e.postData.contents) : e.parameter)))).setMimeType(ContentService.MimeType.JSON);
+      case 'cancelLeaveSalary':
+        return ContentService.createTextOutput(JSON.stringify(cancelLeaveSalary(((e.postData && e.postData.contents) ? JSON.parse(e.postData.contents) : e.parameter)))).setMimeType(ContentService.MimeType.JSON);
+      case 'getLeaveSalaryHistory':
+        return ContentService.createTextOutput(JSON.stringify(getLeaveSalaryHistory(e.parameter))).setMimeType(ContentService.MimeType.JSON);
+      case 'generateLeaveSalaryVoucher':
+        return ContentService.createTextOutput(JSON.stringify(generateLeaveSalaryVoucher(e.parameter))).setMimeType(ContentService.MimeType.JSON);
+      case 'reprintLeaveSalaryVoucher':
+        return ContentService.createTextOutput(JSON.stringify(reprintLeaveSalaryVoucher(((e.postData && e.postData.contents) ? JSON.parse(e.postData.contents) : e.parameter)))).setMimeType(ContentService.MimeType.JSON);
+      case 'setLeaveTicketAmount':
+        return ContentService.createTextOutput(JSON.stringify(setLeaveTicketAmount(((e.postData && e.postData.contents) ? JSON.parse(e.postData.contents) : e.parameter)))).setMimeType(ContentService.MimeType.JSON);
 
       // ============================================================
       // 🌴 LEAVE LIFECYCLE (LeaveLifecycle.gs)
       // ============================================================
+      case 'amendLeaveGrant':
+        return ContentService.createTextOutput(JSON.stringify(amendLeaveGrant(((e.postData && e.postData.contents) ? JSON.parse(e.postData.contents) : e.parameter)))).setMimeType(ContentService.MimeType.JSON);
       case 'grantLeave':
         return ContentService.createTextOutput(JSON.stringify(grantLeave(e.parameter))).setMimeType(ContentService.MimeType.JSON);
       case 'getLeaveGrants':
@@ -256,6 +409,26 @@ function handleRequest(e) {
         return ContentService.createTextOutput(JSON.stringify(getLeaveStatusReminders(e.parameter))).setMimeType(ContentService.MimeType.JSON);
       case 'getRemainingVacationTally':
         return ContentService.createTextOutput(JSON.stringify(getRemainingVacationTally(e.parameter))).setMimeType(ContentService.MimeType.JSON);
+
+      // ── Approval gate. grantLeave now only REQUESTS; these decide. ──
+      // Decisions come by POST so a bulk approve can carry more grant ids
+      // than a URL should, but a GET with a single grantId still works.
+      case 'approveLeaveGrant':
+        return ContentService.createTextOutput(JSON.stringify(approveLeaveGrant(cgBody_(e)))).setMimeType(ContentService.MimeType.JSON);
+      case 'rejectLeaveGrant':
+        return ContentService.createTextOutput(JSON.stringify(rejectLeaveGrant(cgBody_(e)))).setMimeType(ContentService.MimeType.JSON);
+      case 'cancelLeaveGrant':
+        return ContentService.createTextOutput(JSON.stringify(cancelLeaveGrant(cgBody_(e)))).setMimeType(ContentService.MimeType.JSON);
+      case 'getLeaveRegister':
+        return ContentService.createTextOutput(JSON.stringify(getLeaveRegister(e.parameter))).setMimeType(ContentService.MimeType.JSON);
+      case 'auditLeaveGrants':
+        return ContentService.createTextOutput(JSON.stringify(auditLeaveGrants(e.parameter))).setMimeType(ContentService.MimeType.JSON);
+      case 'recompileLeaveGrants':
+        return ContentService.createTextOutput(JSON.stringify(recompileLeaveGrants(cgBody_(e)))).setMimeType(ContentService.MimeType.JSON);
+      case 'previewLeaveApprovalMigration':
+        return ContentService.createTextOutput(JSON.stringify(previewLeaveApprovalMigration(cgBody_(e)))).setMimeType(ContentService.MimeType.JSON);
+      case 'commitLeaveApprovalMigration':
+        return ContentService.createTextOutput(JSON.stringify(commitLeaveApprovalMigration(cgBody_(e)))).setMimeType(ContentService.MimeType.JSON);
 
       // ============================================================
       // 🗂️ LEAVE TYPES + ALLOCATION (LeaveTypes.gs)
@@ -305,16 +478,38 @@ function handleRequest(e) {
         return ContentService.createTextOutput(JSON.stringify(reprintEncashmentVoucher(e.parameter))).setMimeType(ContentService.MimeType.JSON);
       case 'buildOtMergeSheet':
         return ContentService.createTextOutput(JSON.stringify(buildOtMergeSheet(e.parameter))).setMimeType(ContentService.MimeType.JSON);
+      // RETIRED: buildAttendanceDaily used the old pre-roster compile and
+      // would overwrite roster-aware rows with guessed "Default Day Off".
+      // The stub in AttendanceDaily.gs returns a clear error. Kept routed
+      // so an old call fails loudly rather than 404-ing as 'Invalid method'.
       case 'buildAttendanceDaily':
         return ContentService.createTextOutput(JSON.stringify(buildAttendanceDaily(e.parameter))).setMimeType(ContentService.MimeType.JSON);
       case 'getSupervisorSessions':
         return ContentService.createTextOutput(JSON.stringify(getSupervisorSessions(e.parameter))).setMimeType(ContentService.MimeType.JSON);
-      case 'correctSession':
-        return ContentService.createTextOutput(JSON.stringify(correctSession((e.postData && e.postData.contents) ? JSON.parse(e.postData.contents) : e.parameter))).setMimeType(ContentService.MimeType.JSON);
-      case 'addSession':
-        return ContentService.createTextOutput(JSON.stringify(addSession((e.postData && e.postData.contents) ? JSON.parse(e.postData.contents) : e.parameter))).setMimeType(ContentService.MimeType.JSON);
-      case 'deleteSession':
-        return ContentService.createTextOutput(JSON.stringify(deleteSession((e.postData && e.postData.contents) ? JSON.parse(e.postData.contents) : e.parameter))).setMimeType(ContentService.MimeType.JSON);
+      case 'correctSession': {
+        // Same rules as the verification list: proven identity, never his
+        // own day, never a time that has not happened yet.
+        const body = (e.postData && e.postData.contents) ? JSON.parse(e.postData.contents) : e.parameter;
+        const g = svGuardCorrection(body, 'correctSession');
+        const res = g.ok ? correctSession(body) : { success: false, error: g.error };
+        return ContentService.createTextOutput(JSON.stringify(res)).setMimeType(ContentService.MimeType.JSON);
+      }
+      case 'addSession': {
+        // Same rules as the verification list: proven identity, never his
+        // own day, never a time that has not happened yet.
+        const body = (e.postData && e.postData.contents) ? JSON.parse(e.postData.contents) : e.parameter;
+        const g = svGuardCorrection(body, 'addSession');
+        const res = g.ok ? addSession(body) : { success: false, error: g.error };
+        return ContentService.createTextOutput(JSON.stringify(res)).setMimeType(ContentService.MimeType.JSON);
+      }
+      case 'deleteSession': {
+        // Same rules as the verification list: proven identity, never his
+        // own day, never a time that has not happened yet.
+        const body = (e.postData && e.postData.contents) ? JSON.parse(e.postData.contents) : e.parameter;
+        const g = svGuardCorrection(body, 'deleteSession');
+        const res = g.ok ? deleteSession(body) : { success: false, error: g.error };
+        return ContentService.createTextOutput(JSON.stringify(res)).setMimeType(ContentService.MimeType.JSON);
+      }
       case 'migrateLeaveBalances':
         return ContentService.createTextOutput(JSON.stringify(migrateLeaveBalances(e.parameter))).setMimeType(ContentService.MimeType.JSON);
 
@@ -879,6 +1074,11 @@ function loginStaffKiosk(params) {
 // SESSION HELPERS (overnight-safe) — a session is Check In -> Check Out,
 // spanning any dates. All kiosk stage logic derives from these.
 // ============================================================
+// How many hours an un-closed session keeps the kiosk locked to its next
+// stage. Deliberately separate from AC_MAX_SESSION_HOURS (20) — see the
+// note in the session builder for why 17.
+const AC_STALE_OPEN_HOURS = 17;
+
 function kioskSessionState_(attData, empId) {
   const H = attData[0];
   const cId = H.findIndex(h => String(h).trim().toLowerCase() === 'employee id');
@@ -892,13 +1092,50 @@ function kioskSessionState_(attData, empId) {
     punches.push({ ts: ts, stage: String(attData[i][cStage]).trim() });
   }
   punches.sort((a, b) => a.ts - b.ts);
+  // A punch in the future has not happened. On 20-09 supervisors wrote
+  // check-outs at shift ends that had not come yet; the kiosk read them as
+  // "already checked out", refused the man's real Check Out, and his next
+  // tap went in as a Check In. Ignore them.
+  const now = new Date();
+  // How long an un-closed session keeps the kiosk locked to its next
+  // stage. This is NOT AC_MAX_SESSION_HOURS, which asks a different
+  // question ("are these punches plausible?") and must stay at 20.
+  //
+  // Two things have to hold at once:
+  //   • a man at the end of a real double shift — 15-16h, 12:26 → 03:30 —
+  //     must still be able to Check OUT, so the session cannot expire
+  //     under about 16 hours;
+  //   • a man who forgot to check out last night must be able to Check IN
+  //     for today's shift. The tightest real gap is Jabriya/Qurain second
+  //     shift: in at 18:30, back at the kiosk 12:28 next day — 17.9h.
+  //
+  // 17h sits in that gap. At 20h a second-shift man who forgets his
+  // check-out is locked out of his next shift until mid-afternoon, which
+  // is what happened on 01-10: the kiosk kept showing him Break In.
+  const staleH = (typeof AC_STALE_OPEN_HOURS === 'number') ? AC_STALE_OPEN_HOURS : 17;
   let open = false, stage = 'none', openTs = null;
   for (const p of punches) {
-    if (p.stage === 'Check In') { open = true; stage = 'checked_in'; openTs = p.ts; }
+    if (p.ts > now) continue;
+    if (p.stage === 'Check In') {
+      // A Check In while a shift is open is a repeat tap — UNLESS that shift
+      // has been open 20h or more: then it is a forgotten check-out from an
+      // earlier day and this Check In starts the new shift. (Before 22-09 the
+      // repeat rule swallowed these too, so one missed check-out locked the
+      // man out for good: every later Check In was ignored and the kiosk kept
+      // showing the first screen — Kiran Bhujel 20-09 → 22-09.)
+      if (open && openTs && (p.ts - openTs) / 3600000 < staleH) continue;
+      open = true; stage = 'checked_in'; openTs = p.ts;
+    }
     else if (!open) { continue; }
     else if (p.stage === 'Break Out') { stage = 'on_break'; }
     else if (p.stage === 'Break In') { stage = 'break_done'; }
     else if (p.stage === 'Check Out') { open = false; stage = 'none'; openTs = null; }
+  }
+  // A check-in left open for 20 hours or more is a forgotten check-out from
+  // an earlier shift, not the shift he is standing at the kiosk for. Let him
+  // check in; the old day goes on his supervisor's list to be answered.
+  if (open && openTs && (now - openTs) / 3600000 >= staleH) {
+    return { stage: 'none', open: false, openCheckInTs: null, staleOpenTs: openTs };
   }
   return { stage: stage, open: open, openCheckInTs: openTs };
 }
@@ -1012,7 +1249,12 @@ function markKioskAttendance(params) {
       if (stageErr) return { success: false, error: stageErr };
     }
 
-    attSheet.appendRow([timestamp, empId, empName, punchDate, stage, 'Verified', geo.nearest || empBranch,
+    // Auth and Branch can be supplied by another front door (the QR terminal
+    // in QrPunch.gs passes 'QR' and the tablet's own location). Left out, this
+    // behaves exactly as it always has for the phone kiosk.
+    const authLabel = String(params.auth || '').trim() || 'Verified';
+    const branchLabel = String(params.branchOverride || '').trim() || (geo.nearest || empBranch);
+    attSheet.appendRow([timestamp, empId, empName, punchDate, stage, authLabel, branchLabel,
       geo.lat === null ? '' : geo.lat, geo.lng === null ? '' : geo.lng,
       geo.distance === null ? '' : geo.distance, geo.flag]);
 
